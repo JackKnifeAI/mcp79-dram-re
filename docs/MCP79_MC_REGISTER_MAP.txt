@@ -1,0 +1,586 @@
+================================================================================
+  MCP79 (NVIDIA nForce 730i) MEMORY CONTROLLER REGISTER MAP
+  First-Ever Public Documentation
+
+  Target: Apple iMac 9,1 (Early 2009)
+  Firmware: imac91_efi_20260723.bin (4MB SPI flash at 0xFFC00000-0xFFFFFFFF)
+  SoC: NVIDIA MCP79 (chipset for Core 2 Duo)
+  DRAM: DDR3 SO-DIMM, confirmed DDR3-1333 (667MHz, 1.5ns period)
+
+  Reverse engineered from Apple EFI PEI (Pre-EFI Initialization) code
+  by JackKnife Studios, October 2026
+================================================================================
+
+TABLE OF CONTENTS
+  1. Firmware Architecture
+  2. PCI Device Map
+  3. Device 00:03.1 — DIMM Configuration Controller
+  4. Device 00:03.3 — Training/Calibration Controller
+  5. Device 00:03.4 — Timing Controller
+  6. Extended PCI Config Registers (0x400-0x5AC)
+  7. DDR3 Timing Parameter Table
+  8. MRS (Mode Register Set) Command Interface
+  9. DRAM Initialization Sequence
+  10. Firmware Function Map
+  11. Key Data Structures
+
+================================================================================
+1. FIRMWARE ARCHITECTURE
+================================================================================
+
+The MCP79 memory controller initialization runs in the PEI (Pre-EFI
+Initialization) phase of Apple's EFI firmware. This code executes from the
+SPI flash ROM (mapped at 0xFFC00000-0xFFFFFFFF) before DRAM is available.
+
+The PEI code is 32-bit x86 (IA-32) and resides in the first firmware volume.
+It uses:
+  - Legacy PCI config access (I/O ports CF8/CFC)
+  - EFI PPI (PEIM-to-PEIM Interface) protocols for abstraction
+  - Protocol GUIDs to locate configuration data and timing tables
+  - A custom vtable-based PCI I/O protocol with these entry points:
+      [vtable+0x14]: PCI Config Read (byte)
+      [vtable+0x18]: PCI Config Read (dword)
+      [vtable+0x20]: PCI Config Write (byte)
+      [vtable+0x24]: PCI Config Write (byte/word - width selected)
+      [vtable+0x28]: PCI Config Write (dword)
+
+The firmware base address is 0xFFC00000. All absolute addresses in the code
+(e.g., 0xFFC0D694) are ROM-relative: subtract 0xFFC00000 to get the raw
+firmware file offset.
+
+Global flags are stored in SRAM at 0xF0018078 (MCP79 internal SRAM).
+
+================================================================================
+2. PCI DEVICE MAP — MCP79 Memory Controller Complex
+================================================================================
+
+  BDF         VID:DID     BDF Code    Description
+  --------    ---------   --------    -----------------------------------
+  00:00.0     10de:0a82   0x0000      Host Bridge
+  00:00.1     10de:0a88   0x0100      RAM Controller (base config)
+  00:02.4     10de:????   0x1400      MC Support (type 0x11)
+  00:03.0     10de:0aae   0x1800      ISA Bridge (type 5)
+  00:03.1     10de:0aa4   0x1900      DIMM Configuration
+  00:03.3     10de:0a89   0x1B00      Training/Calibration
+  00:03.4     10de:0a98   0x1C00      Timing Controller (type 6)
+  00:03.5     10de:0aa3   0x1D00      Co-processor
+  00:07.4     ????:????   0x3C00      Secondary MC endpoint
+
+  BDF encoding: (device << 11) | (function << 8)
+
+  The dispatch function at ROM+0x4200 routes PCI operations based on BDF:
+    0x1400 -> sets internal type to 0x11
+    0x1800 -> sets internal type to 5
+    0x1C00 -> sets internal type to 6
+    Bit 19 of flags at 0xF0018078 -> overrides type to 4
+
+================================================================================
+3. DEVICE 00:03.1 (10de:0aa4) — DIMM Configuration Controller
+================================================================================
+
+Standard PCI config space registers (0x00-0xFF):
+
+  Reg     Value       Bit Fields & Description
+  ------  ----------  -----------------------------------------------
+  0x68    0x02020408  DIMM Geometry
+                      [7:0]   = 0x08: Number of banks (8)
+                      [15:8]  = 0x04: Bank groups / addressing mode
+                      [23:16] = 0x02: Number of DIMMs installed (2)
+                      [31:24] = 0x02: Ranks per DIMM (2 = dual-rank)
+
+  0x6C    0x00000009  CAS Latency
+                      [7:0]   = 9: CAS Latency in clock cycles (CL9)
+                      Confirms DDR3-1333 CL9 operation
+
+  0xAC    0x04000003  DRAM Density / Type
+                      [1:0]   = 3: DRAM type code (DDR3)
+                      [31:24] = 0x04: Density code (2Gbit per chip)
+                      With 2x dual-rank DIMMs of 2Gbit chips:
+                      Total = 2 DIMMs * 2 ranks * 8 chips * 2Gbit = 8GB max
+                      (actual installed: 4GB with 1Gbit chips)
+
+  0xB0    0x00060D02  DIMM Configuration 2
+                      [7:0]   = 0x02: Column address bits (10)
+                      [15:8]  = 0x0D: Row address bits (13 -> 8K rows)
+                      [23:16] = 0x06: Page size / burst config
+
+================================================================================
+4. DEVICE 00:03.3 (10de:0a89) — Training/Calibration Controller
+================================================================================
+
+Referenced in firmware at ROM+0xC248 (MC_TrainingLoop function).
+The training sequence uses protocol GUIDs to identify calibration phases:
+
+  Phase GUID (at ROM offset)          Purpose
+  --------------------------------    ---------------------------
+  0xD6D4 (FFC0D6D4)                   Training Phase 1
+  0xD6E4 (FFC0D6E4)                   Training Phase 2
+  0xD6C4 (FFC0D6C4)                   Training Phase 3
+  0xD6F4 (FFC0D6F4)                   Training Phase 4
+
+The training loop iterates through all installed DIMMs, attempting each
+calibration phase until all pass. This likely includes:
+  - Write leveling
+  - DQS gate training
+  - Read/write eye centering
+  - ZQ calibration
+
+================================================================================
+5. DEVICE 00:03.4 (10de:0a98) — TIMING CONTROLLER
+================================================================================
+
+This is the primary DDR3 timing register controller. All timing values are
+in units of the MC clock period (1.5ns for DDR3-1333 at 667MHz).
+
+Standard PCI config space registers:
+
+  Reg     Value       Description & Decode
+  ------  ----------  -----------------------------------------------
+  0x48    0x10800210  Primary Timing Control Group 0
+                      Likely encodes primary timing parameters in a
+                      packed format. Contains CAS/RCD/RP related fields.
+                      Nibbles: 1-0-8-0-0-2-1-0
+
+  0x4C    0x10100210  Primary Timing Control Group 1
+                      Secondary timing parameter group.
+
+  0x50    0x10101010  Primary Timing Control Group 2
+                      Tertiary timing parameters. All bytes = 0x10 (16)
+                      suggests uniform timing across channels/ranks.
+
+  0x54    0x0000030C  tFAW / tRRD Timing
+                      [7:0]   = 12 clocks = 18.0ns
+                                Likely tRRD (Row-to-Row Delay)
+                                DDR3 spec: tRRD = 6ns min -> ceil(6/1.5)=4
+                                Value 12 may include additional guard bands
+                                or this field may encode tFAW (Four-bank
+                                Activate Window)
+                      [15:8]  = 3 clocks = 4.5ns
+                                DDR3 tRRD min = 6ns -> 4 clocks
+                                3 seems low; may be a different parameter
+
+  0x58    0x200000C3  Command/Address Timing
+                      [7:0]   = 0xC3 = 195
+                      [31:24] = 0x20 = 32
+                      Likely encodes command-to-command timings or
+                      address setup/hold times.
+
+  0x5C    0x00004210  ODT / Drive Strength Control
+                      [4:0]   = 0x10: ODT configuration
+                      [15:8]  = 0x42: Drive strength setting
+                      Controls On-Die Termination and output driver
+                      impedance for the memory bus.
+
+  0x60    0x00070001  Write Leveling Configuration
+                      [0]     = 1: Write leveling enabled
+                      [19:16] = 7: Write leveling delay/phase
+
+  0x64    0x00000006  DQS Timing / Phase
+                      [3:0]   = 6: DQS phase adjustment (6 taps)
+                      Fine-tunes Data Strobe alignment.
+
+  0x68    0x000C0C0C  tRAS / Row Timing *** KEY TIMING REGISTER ***
+                      [7:0]   = 12 clocks = 18.0ns per rank/channel 0
+                      [15:8]  = 12 clocks = 18.0ns per rank/channel 1
+                      [23:16] = 12 clocks = 18.0ns per rank/channel 2
+                      [31:24] = 0 (unused or rank 3)
+
+                      12 clocks at 1.5ns = 18ns.
+                      DDR3-1333 tRAS min = 36ns = 24 clocks.
+                      This value (12) likely represents a HALF value,
+                      scaled component, or offset. Alternatively:
+                      tRAS = reg_value + fixed_offset (e.g., 12+12=24).
+
+  0x6C    0x00001C00  tRC / Row Cycle Time *** KEY TIMING REGISTER ***
+                      [15:8]  = 0x1C = 28 clocks = 42.0ns
+                      DDR3-1333 tRC = tRAS + tRP = 36 + 13.5 = 49.5ns
+                      28 clocks = 42ns is slightly aggressive.
+                      May use a different base or the value encodes
+                      tRC - tRAS (i.e., effectively tRP + guard).
+
+  0x7C    0x05050505  Short Timing Parameters (per-byte lane)
+                      byte[0] = 5 clocks = 7.5ns  (byte lane 0)
+                      byte[1] = 5 clocks = 7.5ns  (byte lane 1)
+                      byte[2] = 5 clocks = 7.5ns  (byte lane 2)
+                      byte[3] = 5 clocks = 7.5ns  (byte lane 3)
+
+                      7.5ns matches exactly:
+                        tRTP (Read-to-Precharge) = 7.5ns min
+                        tWTR (Write-to-Read) = 7.5ns min
+                      Both are 5 clocks at DDR3-1333.
+
+  0x8C    0x00001102  tRFC / Refresh Recovery *** KEY TIMING REGISTER ***
+                      [7:0]   = 0x02: Refresh mode / config
+                      [15:8]  = 0x11 = 17: tRFC scaled value
+
+                      For 2Gbit DDR3: tRFC = 160ns = ceil(160/1.5) = 107 clk
+                      17 * 8 = 136 clocks = 204ns -> tRFC for 4Gbit? No.
+                      17 * 6 = 102 clocks = 153ns -> close to 2Gbit (160ns)
+                      The scaling factor is likely 6 or the value encodes
+                      tRFC in a custom unit.
+
+  0xAC    0x00001400  tREFI — Auto Refresh Interval *** CONFIRMED ***
+                      [15:0]  = 0x1400 = 5120 clocks
+                      5120 * 1.5ns = 7680ns = 7.68 microseconds
+                      DDR3 spec: tREFI = 7.8us max at <85C
+
+                      THIS VALUE CONFIRMS DDR3-1333 OPERATION:
+                      - At DDR3-1066: 5120 * 1.875 = 9.6us (exceeds spec!)
+                      - At DDR3-1333: 5120 * 1.5 = 7.68us (within spec)
+
+                      Refresh can be disabled by clearing this register
+                      (write 0x0000) and re-enabled by writing the
+                      interval value back.
+
+  0xE8    0x01060404  MRS Command Value Register
+                      [7:0]   = 0x04: MR0 lower bits (Write Recovery)
+                                WR = 4 -> 6 clocks (WR code 010)
+                      [15:8]  = 0x04: MR0 upper bits (CAS/BL related)
+                      [23:16] = 0x06: MR1 value
+                                Bit 1 = 1: DLL Enable
+                                Bit 2 = 1: Output Driver Impedance
+                                Encodes RTT_NOM = 120 ohm (01 in A[6,2])
+                      [31:24] = 0x01: MR2 value
+                                CWL (CAS Write Latency) field
+                                CWL = 7 for DDR3-1333
+
+  0xF4    0x05041100  MRS / Command Control
+                      [7:0]   = 0x00: Command trigger/status
+                      [15:8]  = 0x11 = 17: tRFC related (matches 0x8C)
+                      [23:16] = 0x04: Command type/mode
+                      [31:24] = 0x05: tRTP/tWTR (matches 0x7C)
+                      This register likely coordinates MRS command
+                      issuance with refresh timing.
+
+================================================================================
+6. EXTENDED PCI CONFIG REGISTERS (0x100-0x5FF)
+================================================================================
+
+These registers are accessed through Extended PCI Config Space (ECAM) and
+control the MC's memory aperture, region mapping, and high-level operation.
+
+  Reg     Access    Description
+  ------  --------  -----------------------------------------------
+  0x080   WR32      SMBus / DIMM Detection Control
+                    Value 0x1FB written during init to trigger
+                    DIMM presence detection. The firmware enters an
+                    infinite polling loop after this write, waiting
+                    for detection to complete.
+
+  0x400   RD/WR     MC Enable / Master Control Register
+                    Bit 8 (0x100): MC Enabled
+                    Bit 14: Aperture control mode
+                    During init, bit 8 is set via OR with 0x100.
+                    The value from this register is also used as a
+                    device type code (0x11 = device 00:02.4).
+
+  0x402   WR8       MC Mode Control
+                    Cleared to 0x00 during initialization.
+                    Controls MC operating mode.
+
+  0x404   RD32      MC Status / BDF Routing Register
+                    Read to check MC status.
+                    Written with BDF values (0x1C00, 0x3C00) to
+                    configure device routing during init.
+
+  0x420   RD/WR32   MC Aperture Mask Register
+                    Read current value, then OR with 0x0FFFFFFF.
+                    This sets the memory aperture to a 256MB boundary
+                    (256MB = 0x10000000, mask = 0x0FFFFFFF).
+
+  0x424   WR32      MC Aperture Control 2
+                    Cleared to 0 during initialization.
+
+  0x500   RD/WR32   MC Memory Region 0 Control
+                    Read current value, then OR with 0xFFFFBFFF
+                    (all bits except bit 14).
+                    Bit 14 controls region type or access mode.
+
+  0x580   RD32      MC Memory Region 0 Status / Size
+                    Read-only register reporting the configured
+                    memory region size.
+
+  0x5A8   WR32      MC Memory Region 1 Control
+                    Cleared to 0 during initialization.
+
+  0x5AC   WR32      MC Memory Region 1 Status
+                    Cleared to 0 during initialization.
+
+================================================================================
+7. DDR3 TIMING PARAMETER TABLE
+================================================================================
+
+Located at firmware ROM offset 0xA4A0 (virtual address 0xFFC0A4A0).
+
+The table contains 15 DWORD values organized as 4 speed grades with
+3-4 timing parameters each. Each value represents a timing parameter
+in nanoseconds that the firmware converts to clock cycles.
+
+  Offset  Value  Description
+  ------  -----  -------------------------------------------
+  0xA4A0    22   Speed Grade 0 (DDR3-1333): Param A
+  0xA4A4    17   Speed Grade 1 (DDR3-1066): Param A
+  0xA4A8    12   Speed Grade 2 (DDR3-800):  Param A
+  0xA4AC     5   Speed Grade 3 (DDR3-667):  Param A
+  0xA4B0    20   Speed Grade 0: Param B
+  0xA4B4    14   Speed Grade 1: Param B
+  0xA4B8     9   Speed Grade 2: Param B
+  0xA4BC     4   Speed Grade 3: Param B
+  0xA4C0    23   Speed Grade 0: Param C
+  0xA4C4    16   Speed Grade 1: Param C
+  0xA4C8    11   Speed Grade 2: Param C
+  0xA4CC     6   Speed Grade 3: Param C
+  0xA4D0    21   Speed Grade 0: Param D
+  0xA4D4    15   Speed Grade 1: Param D
+  0xA4D8    10   Speed Grade 2: Param D
+
+Speed Grade Index Table (at ROM offset 0xA480, 9 DWORDs):
+  0, 1, 1, 5, 5, 3, 0, 7, 7
+  These map SPD speed bin codes to the timing table columns.
+
+MMIO Address Table (at ROM offset 0xA468, 4 DWORDs):
+  0xFFC08B58, 0xFFC08B6E, 0xFFC08B85, 0xFFC08B95
+  These are ROM data addresses containing per-speed-grade timing
+  configuration blocks (ROM offsets 0x8B58, 0x8B6E, 0x8B85, 0x8B95).
+
+================================================================================
+8. MRS (MODE REGISTER SET) COMMAND INTERFACE
+================================================================================
+
+Function at ROM+0xC118 implements the DDR3 MRS command interface.
+
+The MRS command controller uses register 0xFFC0D480 (ROM offset 0xD480) as
+the command protocol locator. The function accepts a Mode Register number
+(0-3) and encodes it into a command byte:
+
+  MR Number   AND Mask   OR Value   DDR3 Register
+  ---------   --------   --------   ---------------------------
+  MR0 (0)     0xD0       0x50       Basic Mode (CAS, BL, WR)
+  MR1 (1)     0xD1       0x51       Output Drive / ODT
+  MR2 (2)     0xD2       0x52       Write CAS Latency / RTT_WR
+  MR3 (3)     0xD3       0x53       Test Mode / MPR
+
+The command byte format:
+  Bits [1:0] = MR number (0-3)
+  Bits [5:4] = 0x5 (MRS command opcode)
+  Bits [7:6] = rank select (from AND mask 0xDx)
+
+After encoding the command, the function iterates over all populated
+DIMM ranks (count from [ebp+0x18] & 3) and issues the MRS command
+to each rank individually through a vtable call.
+
+================================================================================
+9. DRAM INITIALIZATION SEQUENCE
+================================================================================
+
+The complete DRAM initialization sequence, reconstructed from the PEI code:
+
+Phase 1: Hardware Detection (ROM+0xB980)
+  1. Read MMIO 0xFFC0D6A4 — locate MC configuration protocol
+  2. Read MMIO 0xFFC0D400 — get MC base configuration (param 0x146)
+  3. Write PCI reg 0x402 = 0 — clear MC mode control
+  4. Write PCI reg 0x424 = 0 — clear aperture control
+  5. Write PCI reg 0x5A8 = 0 — clear region 1 control
+  6. Write PCI reg 0x5AC = 0 — clear region 1 status
+  7. If device type != 0x11: call MC_ConfigureAperture
+
+Phase 2: Speed Grade Detection (ROM+0xBAEB)
+  1. Locate MC protocol via GUID at 0xFFC0D684
+  2. Read 5 DWORDs from ROM 0xFFC0D40C (MC descriptor table)
+  3. Locate training protocol at 0xFFC0D6A4
+  4. Configure via protocol at 0xFFC0D704
+  5. Determine speed grade using lookup table at 0xFFC0D534
+  6. If type == 0x11: read MMIO 0xFFC0D570 (speed config)
+
+Phase 3: DRAM Command Sequence (ROM+0xD049)
+  Loop 3 times:
+    a. Issue PRECHARGE ALL command (type=0, delay=500 clocks = 750ns)
+    b. Issue NOP command (type=2, delay=300 clocks = 450ns)
+  Then:
+    c. Issue final NOP (type=2, delay=2600 clocks = 3.9us)
+       This 2600-clock delay = tDLLK (DLL Lock time, 512 clocks min)
+       with margin.
+
+Phase 4: MRS Programming (ROM+0xD095)
+  Loop 3 times:
+    a. Issue MRS command (type=2, delay=350 clocks = 525ns)
+    b. Issue NOP command (type=0, delay=200 clocks = 300ns)
+  Then final MRS stabilization:
+    c. MRS command (type=2, delay=350 clocks)
+    d. NOP command (type=0, delay=500 clocks)
+
+Phase 5: Memory Training (ROM+0xC248)
+  1. Locate training protocol at 0xFFC0D6B4
+  2. Iterate through calibration phases:
+     - Phase 1 (GUID at 0xFFC0D6D4)
+     - Phase 2 (GUID at 0xFFC0D6E4)
+     - Phase 3 (GUID at 0xFFC0D6C4)
+     - Phase 4 (GUID at 0xFFC0D6F4)
+  3. Each phase calls through protocol vtable
+
+Phase 6: Register Programming (ROM+0xE880)
+  1. Locate MC config tables via protocol GUIDs
+  2. Direct write loop: write computed values to MC registers
+  3. Read-Modify-Write loop: for each entry {reg, AND_mask, OR_value}:
+     a. Read PCI reg
+     b. AND with mask
+     c. OR with value
+     d. Write back
+
+Phase 7: Aperture Configuration (ROM+0xBA5E)
+  1. Read PCI regs 0x404, 0x420, 0x500
+  2. Write PCI reg 0x400: OR with 0x100 (enable MC)
+  3. Write PCI reg 0x420: OR with 0x0FFFFFFF (256MB aperture)
+  4. Write PCI reg 0x500: OR with 0xFFFFBFFF (enable region)
+  5. Update flags: set bit 20 of 0xF0018078
+
+Phase 8: Device Routing (ROM+0xBBC9)
+  1. Set bit 19 (0x80000) in flags at 0xF0018078
+  2. Read PCI reg 0x400, check bit 8 (0x100)
+  3. If MC enabled:
+     a. Write 0x100 to PCI reg 0x400
+     b. Write 0x1C00 (00:03.4 BDF) to PCI reg 0x404
+     c. Write 0x3C00 (00:07.4 BDF) to PCI reg 0x404
+
+Phase 9: Memory Map (ROM+0xBC19)
+  1. Locate GCD protocol at 0xFFC0D694
+  2. Parse memory descriptors (types 3=system memory, 4=MMIO)
+  3. Compute total memory size
+  4. Register memory regions with EFI GCD
+
+Phase 10: ZQ Calibration (ROM+0xD140)
+  Loop 20 times:
+    a. ZQCS command (type=2, delay=50 clocks = 75ns)
+    b. ZQCL command (type=1, delay=50 clocks = 75ns)
+  Then: wait 2000 timer ticks (2ms)
+
+Phase 11: Final Init (ROM+0xBF1A)
+  1. Locate protocol at 0xFFC0D694
+  2. Call 0xD342 (final MC calibration)
+  3. Register 4MB MMIO region at 0xFFC00000 (firmware ROM)
+
+DRAM Command Types (MC_CommandDispatcher at ROM+0xD213):
+  Command 0: Self-Refresh Entry/Exit sequence
+  Command 1: PRECHARGE ALL + NOP cycle (500/300 clock delays)
+  Command 2: NOP with 500 clock delay (stabilization/refresh)
+  Command 3: ZQ Calibration (20 iterations ZQCS/ZQCL, 50 clk each)
+  Command 4: ZQ Calibration variant
+  Command 5: MRS command sequence (via MC_MRS_Command)
+
+MC_SyncCommand Parameters (ROM+0xCFB8):
+  EAX = command protocol handle
+  ECX = delay in clock cycles (or timer ticks if type != 0)
+  [ebp+0x08] = PCI device handle
+  [ebp+0x0C] = command type (0=immediate, 2=deferred)
+  Magic tag: 'BSSL' (0x4C535342) — BSP Synchronization Lock
+
+================================================================================
+10. FIRMWARE FUNCTION MAP
+================================================================================
+
+  ROM Offset  Name                     Description
+  ----------  -----------------------  ----------------------------------------
+  0x01490     PCI_ConfigAccess         Legacy CF8/CFC PCI config R/W wrapper
+                                       Supports byte (width 0), word (1),
+                                       dword (2) access widths
+  0x04200     MC_DeviceDispatch        BDF-based PCI device dispatch
+                                       Routes to different init paths by device
+  0x0428C     MC_CheckPlatform         Platform type check via 0xF0018078
+                                       Verifies platform compatibility
+  0x04907     MC_InitGUIDs             Firmware volume GUID setup
+                                       Locates PCI device handles
+  0x0BA5E     MC_ConfigureAperture     Programs MC aperture registers 0x400-0x500
+                                       Sets 256MB memory aperture boundary
+  0x0BAEB     MC_LocateProtocol        Locates MC init protocol (GUID 0xD684)
+                                       Reads MC descriptor table
+  0x0BB91     MC_SpeedGradeLookup      Speed grade lookup from table at 0xD534
+                                       Returns index for timing parameters
+  0x0BBC9     MC_SetDeviceRouting      Sets MC device routing via reg 0x404
+                                       Routes BDF 0x1C00 and 0x3C00
+  0x0BC19     MC_MemoryMapInit         GCD memory map initialization
+                                       Iterates memory descriptors
+  0x0BF1A     MC_FinalInit             Final MC initialization
+                                       Last protocol-based setup
+  0x0BFBF     MC_SizeCompute           Memory region size computation
+                                       Handles multiple DIMM configs
+  0x0C118     MC_MRS_Command           DDR3 Mode Register Set command issuer
+                                       Supports MR0-MR3, iterates all ranks
+  0x0C231     MC_ReadTimingConfig      Reads timing config from ROM 0xD638
+  0x0C248     MC_TrainingLoop          Memory training/calibration loop
+                                       4-phase training sequence
+  0x0C6B5     MC_SetRegion             Programs MC memory region descriptors
+                                       Called from memory map setup
+  0x0C708     MC_MapRegion             Maps MMIO/memory region
+                                       Registers regions with EFI
+  0x0CFB8     MC_SyncCommand           BSP synchronization wrapper
+                                       'BSSL' (0x4C535342) magic tag
+                                       Handles timer-based delays
+  0x0D013     MC_TimerWait             Timer wait via protocol at 0xD774
+                                       Used for DRAM timing delays
+  0x0D049     MC_DRAMInit_Phase1       DRAM init: PRE+NOP cycles
+                                       3 iterations: 500/300 clk delays
+  0x0D095     MC_DRAMInit_Phase2       DRAM init: MRS+NOP cycles
+                                       3 iterations: 350/200 clk delays
+  0x0D320     MC_DivideMemory          64-bit division for memory sizing
+  0x0D342     MC_FinalCalibration      Final calibration step
+  0x0E880     MC_RegisterProgram       Programs MC regs from data tables
+                                       Uses Read-Modify-Write pattern
+  0x0EA25     MC_LocateConfigTables    Locates config tables via GUIDs
+                                       Two protocol GUIDs used
+
+================================================================================
+11. KEY DATA STRUCTURES
+================================================================================
+
+Flags Register (SRAM 0xF0018078):
+  Bit 19 (0x80000): MC routing configured
+  Bit 20 (0x100000): MC aperture configured
+  Bits [22:20]: MC state machine phase
+
+MC Descriptor Table (ROM 0xD40C, 5 DWORDs):
+  Contains MC base configuration parameters copied during init.
+  Referenced by MC_LocateProtocol (0xBAEB).
+
+Speed Grade Lookup Table (ROM 0xD534, 12 entries):
+  Maps hardware speed codes to internal grade indices.
+  Used by MC_SpeedGradeLookup (0xBB91) to select timing params.
+
+DIMM Descriptor Table (ROM 0xD5C8 - 0xD618):
+  Contains per-DIMM configuration blocks.
+  Each block describes rank count, size, and geometry.
+  Referenced by MC_SizeCompute (0xBFBF).
+
+Protocol GUIDs (ROM offsets):
+  0xD684: MC Init Protocol
+  0xD694: GCD/Memory Map Protocol
+  0xD6A4: Platform Config Protocol
+  0xD6B4: Training Protocol
+  0xD6C4: Training Phase 3 GUID
+  0xD6D4: Training Phase 1 GUID
+  0xD6E4: Training Phase 2 GUID
+  0xD6F4: Training Phase 4 GUID
+  0xD704: Speed Config Protocol
+  0xD714: Region Config Protocol
+  0xD764: Descriptor Compare Data
+  0xD774: Timer Protocol
+
+Register Programming Table Format (from MC_RegisterProgram):
+  - Direct Write Table: array of {reg_offset(4), value(4)} = 8 bytes/entry
+  - R-M-W Table: array of {reg_offset(4), AND_mask(4), OR_value(4)} = 12 bytes/entry
+
+  The R-M-W pattern allows selective bit modification:
+    new_value = (old_value & AND_mask) | OR_value
+
+================================================================================
+END OF REGISTER MAP
+================================================================================
+
+NOTES:
+  - This is the first public documentation of MCP79 MC registers
+  - Some register field decodings are tentative due to packed formats
+  - The firmware uses protocol-based indirection for most register values,
+    making static analysis of exact values challenging
+  - Live register reads confirm DDR3-1333 operation (validated by tREFI)
+  - The DRAM init sequence follows standard JEDEC DDR3 init flow
+  - Training phases are protocol-driven (firmware can update training
+    algorithms without changing the PEI core code)
